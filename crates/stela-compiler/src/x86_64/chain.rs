@@ -2907,16 +2907,25 @@ fn point_holds(code: &[u8], at: u64, point: u64, instruction: [u8; PATCH_BYTES])
 fn exit_word_of(bytes: &[u8]) -> Option<u32> {
     let field = EXIT_POINT_BYTES + 1;
     let word = u32::from_le_bytes(bytes.get(field..field + 4)?.try_into().ok()?);
-    (0..=MAX_PAD)
+    candidate_pads(bytes)
         .any(|pad| bytes == exit_word_bytes(word, pad))
         .then_some(word)
+}
+
+/// The paddings whose patch point starts with the same byte as the exit.
+fn candidate_pads(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let first = bytes.first().copied();
+    (0..=MAX_PAD).filter(move |&pad| {
+        let head = if pad == 0 { RET_ROOM[0] } else { NOPS[pad][0] };
+        first == Some(head)
+    })
 }
 
 /// Whether `bytes` are the direct exit to `target` of `kind`, of any
 /// padding.
 pub fn is_direct_exit(bytes: &[u8], target: GuestAddress, kind: impl Into<ExitWord>) -> bool {
     let word = kind.into().encoded();
-    (0..=MAX_PAD).any(|pad| bytes == direct_exit_padded(target, word, pad))
+    candidate_pads(bytes).any(|pad| bytes == direct_exit_padded(target, word, pad))
 }
 
 /// Whether `bytes` are the dynamic exit of `kind`, of any padding.
@@ -2936,7 +2945,7 @@ fn direct_exit_of(bytes: &[u8]) -> Option<(GuestAddress, u32)> {
     let target = GuestAddress(u64::from_le_bytes(target.try_into().ok()?));
     let field = DIRECT_TARGET + 10 + 1;
     let word = u32::from_le_bytes(bytes.get(field..field + 4)?.try_into().ok()?);
-    (0..=MAX_PAD)
+    candidate_pads(bytes)
         .any(|pad| bytes == direct_exit_padded(target, word, pad))
         .then_some((target, word))
 }
@@ -2983,18 +2992,14 @@ pub fn align_link_slot(code: &mut [u8], offset: usize, bytes: usize, at: u64) ->
     let Some(slot) = code.get_mut(offset..offset + bytes) else {
         return false;
     };
-    if bytes > MAX_LINK_BYTES {
+    let address = at + offset as u64;
+    if bytes > MAX_LINK_BYTES
+        || bytes < patch_pad(address) + PATCH_BYTES
+        || !(0..8).any(|residue| is_empty_link_at(slot, residue))
+    {
         return false;
     }
-    let mut empty = [0; MAX_LINK_BYTES];
-    let empty = &mut empty[..bytes];
-    if !(0..8).any(|residue| {
-        empty_link_at(residue, empty);
-        *slot == *empty
-    }) {
-        return false;
-    }
-    empty_link_at(at + offset as u64, slot);
+    empty_link_at(address, slot);
     true
 }
 
@@ -3045,12 +3050,25 @@ const MAX_LINK_BYTES: usize = if LINK_BYTES > POLLED_LINK_BYTES {
 /// `at`: the pad, then the patch point's jump to the exit after the slot,
 /// then INT3s.
 fn empty_link_at(at: u64, slot: &mut [u8]) {
-    let bytes = slot.len();
-    let pad = patch_pad(at);
-    slot.fill(0xcc);
+    let (pad, jump) = empty_link_parts(at, slot.len());
     slot[..pad].copy_from_slice(NOPS[pad]);
-    let jump = jump(at + pad as u64, at + bytes as u64).expect("an exit right after its slot");
     slot[pad..pad + PATCH_BYTES].copy_from_slice(&jump);
+    slot[pad + PATCH_BYTES..].fill(0xcc);
+}
+
+/// Whether `slot` holds the empty link slot for `at`.
+fn is_empty_link_at(slot: &[u8], at: u64) -> bool {
+    let (pad, jump) = empty_link_parts(at, slot.len());
+    slot.strip_prefix(NOPS[pad])
+        .and_then(|rest| rest.strip_prefix(jump.as_slice()))
+        .is_some_and(|rest| rest.iter().all(|&byte| byte == 0xcc))
+}
+
+/// The pad and the jump of an empty link slot of `bytes` at `at`.
+fn empty_link_parts(at: u64, bytes: usize) -> (usize, [u8; PATCH_BYTES]) {
+    let pad = patch_pad(at);
+    let jump = jump(at + pad as u64, at + bytes as u64).expect("an exit right after its slot");
+    (pad, jump)
 }
 
 /// The patch that undoes the link of the direct exit at host address

@@ -534,8 +534,8 @@ fn emit_selected(
     let mut fault_recovery = vec![];
     let source_rows = instructions.len() + usize::from(terminal.is_some());
     let mut block = super::Emitted {
+        x86_64_code: Code::new(),
         source_map: Vec::with_capacity(source_rows),
-        ..super::Emitted::default()
     };
     let code = &mut block.x86_64_code;
     code.set_pinned(pinned);
@@ -807,6 +807,8 @@ fn emit_selected(
             bases = super::masked_base::Tracker::carried(&carried);
             emitted_alone = true;
         }
+        // Reuse the lookahead if the next instruction is emitted on its own.
+        let mut next_class: Option<(usize, VectorUse)> = None;
         // A region keeps its own landings (`region_landings`).
         loop_exits.landings[copy] = vec![None; instructions.len() + 1];
         while cursor < instructions.len() {
@@ -836,12 +838,17 @@ fn emit_selected(
                         vector_use(&instructions[at].operation, target)
                     }
                 };
-                let class = class_at(cursor);
+                let class = match next_class.take() {
+                    Some((at, class)) if at == cursor => class,
+                    _ => class_at(cursor),
+                };
                 // Where the next instruction stores or forgets the homes
                 // anyway, results go straight to the state.
-                let next_keeps = cursor + 1 < instructions.len()
-                    && !landing[cursor + 1]
-                    && matches!(class_at(cursor + 1), VectorUse::Keep | VectorUse::Access);
+                let next_keeps = cursor + 1 < instructions.len() && !landing[cursor + 1] && {
+                    let next = class_at(cursor + 1);
+                    next_class = Some((cursor + 1, next));
+                    matches!(next, VectorUse::Keep | VectorUse::Access)
+                };
                 code.set_vector_write_through(!next_keeps);
                 match class {
                     VectorUse::Keep | VectorUse::Access => code.set_vector_cache(true),
